@@ -7,13 +7,16 @@ import (
 	"context"
 	"io/ioutil"
 	"net/url"
+	"os"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/spf13/pflag"
 
 	"github.com/pingcap/errors"
@@ -30,6 +33,10 @@ const (
 	notFound             = "NotFound"
 	// number of retries to make of operations
 	maxRetries = 3
+	// K8s IAM related env vars
+	envAWSWebIdentityTokenFile = "AWS_WEB_IDENTITY_TOKEN_FILE"
+	envAWSRoleARN              = "AWS_ROLE_ARN ARN"
+	envAWSRoleSessionName      = "AWS_ROLE_SESSION_NAME"
 )
 
 // s3Handlers make it easy to inject test functions
@@ -142,6 +149,42 @@ func (options *S3BackendOptions) parseFromFlags(flags *pflag.FlagSet) error {
 		return errors.Trace(err)
 	}
 	return nil
+}
+
+// getCredentials initialize AWS credentials
+func getCredentials(backend *backup.S3) (*credentials.Credentials, error) {
+	// Static credentials
+	if backend.AccessKey != "" || backend.SecretAccessKey != "" {
+		if backend.AccessKey == "" {
+			return nil, errors.New("AWS secret access key provided but access key is empty")
+		}
+		if backend.SecretAccessKey == "" {
+			return nil, errors.New("AWS access key provided but secret access key is empty")
+		}
+		return credentials.NewStaticCredentials(backend.AccessKey, backend.SecretAccessKey, ""), nil
+	}
+
+	// K8s IAM role
+	webIdentityRoleProvider := func() *stscreds.WebIdentityRoleProvider {
+		webIdentityTokenFile, ok := os.LookupEnv(envAWSWebIdentityTokenFile)
+		if !ok {
+			return nil
+		}
+		roleARN, ok := os.LookupEnv(envAWSRoleARN)
+		if !ok {
+			return nil
+		}
+		// Role session name is optional.
+		roleSessionName, _ := os.LookupEnv(envAWSRoleSessionName)
+		sts := sts.New(session.New())
+		return stscreds.NewWebIdentityRoleProvider(sts, roleARN, roleSessionName, webIdentityTokenFile)
+	}()
+	if webIdentityRoleProvider != nil {
+		return credentials.NewCredentials(webIdentityRoleProvider), nil
+	}
+
+	// Default credentials chain.
+	return nil, nil
 }
 
 // newS3Storage initialize a new s3 storage for metadata
